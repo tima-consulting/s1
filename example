@@ -1,0 +1,272 @@
+Super besoin 👌 Voici une manière “propre et centrale” de gérer toutes les erreurs de tes appels Feign et d’indiquer clairement au front quelle source amont a échoué, pourquoi, et quoi faire.
+
+🎯 Objectif
+
+Centraliser le mapping des erreurs (HTTP + techniques) des API externes.
+
+Exposer au front un format unique (RFC 9457 / Problem Details) avec:
+
+title, detail, status
+
+source.service, source.url
+
+code (si dispo), retryable, correlationId
+
+
+
+🧱 1) Modèle d’exception amont
+
+// src/main/java/com/acme/shared/errors/UpstreamServiceException.java
+package com.acme.shared.errors;
+
+public class UpstreamServiceException extends RuntimeException {
+  private final String service;
+  private final String url;
+  private final int httpStatus;
+  private final String code;
+  private final boolean retryable;
+  private final String rawBody;
+
+  public UpstreamServiceException(
+      String message, String service, String url, int httpStatus,
+      String code, boolean retryable, String rawBody, Throwable cause) {
+    super(message, cause);
+    this.service = service;
+    this.url = url;
+    this.httpStatus = httpStatus;
+    this.code = code;
+    this.retryable = retryable;
+    this.rawBody = rawBody;
+  }
+  public String getService() { return service; }
+  public String getUrl() { return url; }
+  public int getHttpStatus() { return httpStatus; }
+  public String getCode() { return code; }
+  public boolean isRetryable() { return retryable; }
+  public String getRawBody() { return rawBody; }
+}
+
+🧩 2) ErrorDecoder Feign (une seule fois pour tous les clients)
+
+// src/main/java/com/acme/shared/feign/CentralFeignErrorDecoder.java
+package com.acme.shared.feign;
+
+import com.acme.shared.errors.UpstreamServiceException;
+import feign.Response;
+import feign.codec.ErrorDecoder;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+public class CentralFeignErrorDecoder implements ErrorDecoder {
+  @Override
+  public Exception decode(String methodKey, Response response) {
+    String service = response.request().requestTemplate().feignTarget().name(); // nom logique Feign
+    String url = response.request().url();
+    int status = response.status();
+
+    String body = null;
+    try {
+      if (response.body() != null) {
+        body = new String(response.body().asInputStream().readAllBytes(), StandardCharsets.UTF_8);
+      }
+    } catch (IOException ignored) {}
+
+    // Essaie d’extraire un code d’erreur applicatif si l’amont renvoie un JSON { code, message, ... }
+    String code = extractCodeSafely(body); // impl simple: regex/JSON parse optionnelle
+    boolean retryable = status >= 500 || status == 429;
+
+    String message = "Erreur amont " + service + " (" + status + ")";
+    return new UpstreamServiceException(message, service, url, status, code, retryable, body, null);
+  }
+
+  private String extractCodeSafely(String body) {
+    if (body == null) return null;
+    // TODO: si tu connais la forme, parse JSON { "code": "..." }
+    return null;
+  }
+}
+
+Configurer Feign pour utiliser ce décodeur (config globale) :
+
+// src/main/java/com/acme/shared/feign/FeignConfig.java
+package com.acme.shared.feign;
+
+import feign.RequestInterceptor;
+import feign.codec.ErrorDecoder;
+import org.springframework.context.annotation.Bean;
+
+public class FeignConfig {
+  @Bean
+  public ErrorDecoder errorDecoder() {
+    return new CentralFeignErrorDecoder();
+  }
+
+  // Propage le correlation-id
+  @Bean
+  public RequestInterceptor correlationIdInterceptor(CorrelationIdHolder holder) {
+    return template -> template.header("X-Correlation-Id", holder.get());
+  }
+}
+
+Et lier chaque client :
+
+@FeignClient(name = "catalog", url="${catalog.url}", configuration = FeignConfig.class)
+public interface CatalogClient {
+  @GetMapping("/items/{id}")
+  ItemDto getItem(@PathVariable String id);
+}
+
+🪪 3) Correlation ID (server + Feign)
+
+// src/main/java/com/acme/shared/http/CorrelationIdFilter.java
+package com.acme.shared.http;
+
+import jakarta.servlet.*;
+import jakarta.servlet.http.HttpServletRequest;
+import org.slf4j.MDC;
+import org.springframework.stereotype.Component;
+import java.io.IOException;
+import java.util.UUID;
+
+@Component
+public class CorrelationIdFilter implements Filter {
+  public static final String HEADER = "X-Correlation-Id";
+
+  @Override public void doFilter(ServletRequest req, ServletResponse res, FilterChain chain)
+      throws IOException, ServletException {
+    HttpServletRequest http = (HttpServletRequest) req;
+    String cid = http.getHeader(HEADER);
+    if (cid == null || cid.isBlank()) cid = UUID.randomUUID().toString();
+    MDC.put(HEADER, cid);
+    try { chain.doFilter(req, res); } finally { MDC.remove(HEADER); }
+  }
+}
+
+Un petit holder injectable :
+
+// src/main/java/com/acme/shared/http/CorrelationIdHolder.java
+package com.acme.shared.http;
+
+import org.slf4j.MDC;
+import org.springframework.stereotype.Component;
+
+@Component
+public class CorrelationIdHolder {
+  public String get() { return MDC.get(CorrelationIdFilter.HEADER); }
+}
+
+🛡️ 4) Global handler (ProblemDetails Spring Boot 3)
+
+// src/main/java/com/acme/shared/errors/GlobalExceptionHandler.java
+package com.acme.shared.errors;
+
+import com.acme.shared.http.CorrelationIdHolder;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ProblemDetail;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.net.URI;
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+  private final CorrelationIdHolder correlationIdHolder;
+
+  public GlobalExceptionHandler(CorrelationIdHolder holder) {
+    this.correlationIdHolder = holder;
+  }
+
+  @ExceptionHandler(UpstreamServiceException.class)
+  ProblemDetail handleUpstream(UpstreamServiceException ex) {
+    ProblemDetail pd = ProblemDetail.forStatus(HttpStatus.BAD_GATEWAY); // 502 coté BFF
+    pd.setType(URI.create("urn:problem:upstream-failure"));
+    pd.setTitle("Upstream service failure");
+    pd.setDetail(ex.getMessage());
+
+    pd.setProperty("source", new Source(ex.getService(), ex.getUrl()));
+    pd.setProperty("upstreamStatus", ex.getHttpStatus());
+    if (ex.getCode() != null) pd.setProperty("code", ex.getCode());
+    pd.setProperty("retryable", ex.isRetryable());
+    pd.setProperty("correlationId", correlationIdHolder.get());
+    return pd;
+  }
+
+  // Exemple: circuit breaker ouvert
+  @ExceptionHandler(CallNotPermittedException.class)
+  ProblemDetail handleCircuitOpen(CallNotPermittedException ex) {
+    ProblemDetail pd = ProblemDetail.forStatus(HttpStatus.SERVICE_UNAVAILABLE); // 503
+    pd.setType(URI.create("urn:problem:upstream-circuit-open"));
+    pd.setTitle("Upstream temporarily unavailable");
+    pd.setDetail("Le circuit est ouvert pour protéger le système.");
+    pd.setProperty("retryable", true);
+    pd.setProperty("correlationId", correlationIdHolder.get());
+    return pd;
+  }
+
+  // Fallback générique
+  @ExceptionHandler(Exception.class)
+  ProblemDetail handleGeneric(Exception ex) {
+    ProblemDetail pd = ProblemDetail.forStatus(HttpStatus.INTERNAL_SERVER_ERROR);
+    pd.setTitle("Unexpected error");
+    pd.setDetail(ex.getMessage());
+    pd.setProperty("correlationId", correlationIdHolder.get());
+    return pd;
+  }
+
+  record Source(String service, String url) {}
+}
+
+🧰 5) (Optionnel mais recommandé) Resilience4j autour de Feign
+
+@Retry, @CircuitBreaker, @TimeLimiter, @RateLimiter sur les méthodes de ton service qui appellent Feign.
+
+Les exceptions Resilience4j seront interceptées par le @RestControllerAdvice ci-dessus.
+
+
+Exemple:
+
+@CircuitBreaker(name = "catalog", fallbackMethod = "fallback")
+public Item getItem(String id) { return mapper.map(client.getItem(id)); }
+
+private Item fallback(String id, Throwable ex) {
+  throw (ex instanceof RuntimeException re) ? re :
+    new UpstreamServiceException("Catalog indisponible", "catalog", "/items/"+id, 0, null, true, null, ex);
+}
+
+🧪 6) Exemple de réponse JSON côté front
+
+{
+  "type": "urn:problem:upstream-failure",
+  "title": "Upstream service failure",
+  "status": 502,
+  "detail": "Erreur amont catalog (504)",
+  "source": { "service": "catalog", "url": "https://api.catalog/items/42" },
+  "upstreamStatus": 504,
+  "code": "CATALOG_TIMEOUT",
+  "retryable": true,
+  "correlationId": "f6bd3e02-7e2a-4f1e-8c5a-5c8a2d2a0b7b"
+}
+
+👉 Le front peut afficher un message user-friendly (“Le service catalog est momentanément indisponible”) et logger le correlationId pour support.
+
+🧭 7) Bonnes pratiques
+
+Normaliser les noms name des Feign clients (@FeignClient(name="...")) → ce sera ta source.service.
+
+Logger côté backend: log en WARN pour 4xx amont, ERROR pour 5xx.
+
+Masquer dans rawBody les données sensibles si tu décides de la logger.
+
+Propagation de X-Correlation-Id vers l’amont (interceptor Feign).
+
+Mapping status côté BFF : renvoyer 502/503/504 selon contexte, pas le 4xx amont brut (sauf cas métier explicitement relayé).
+
+
+
+---
+
+Si tu veux, je peux t’adapter ce squelette à Spring Boot 3.x + Maven, avec un module shared-errors réutilisable et un exemple Feign + Resilience4j prêt à cloner.
+
