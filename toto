@@ -1,0 +1,65 @@
+Parfait 👍 je vois ton Jira ouvert sur l’épic RMP-2120.
+Si tu veux faire entrer ce sujet en fin de sprint, il faut rédiger un ticket clair et concis, avec user story, description, et acceptance criteria bien définis.
+
+Voici une proposition prête à copier dans ton Jira (type Story ou Task selon vos pratiques) :
+
+
+---
+
+Summary
+
+Backend – Centralized error handling for Feign upstream APIs
+
+Epic Link
+
+
+Description
+
+Currently, our backend consumes several external APIs via Feign clients.
+There is no centralized error handling, which leads to inconsistent error responses sent to the frontend.
+
+We need to implement a centralized error management solution that:
+
+Captures upstream errors (timeouts, 4xx, 5xx, circuit breaker open, etc.)
+
+Wraps them into a normalized response (ProblemDetail)
+
+Provides the frontend with:
+
+The source service name (source.service)
+
+The failing endpoint (source.url)
+
+HTTP status code of the upstream
+
+A retryable flag (true/false)
+
+A correlationId for troubleshooting
+
+
+
+This will allow the frontend to display consistent error messages and help support teams quickly identify the failing upstream.
+
+Acceptance Criteria
+
+[ ] All Feign clients use a common ErrorDecoder.
+
+[ ] Errors are mapped into a standard ProblemDetail JSON format.
+
+[ ] Response includes source.service, source.url, status, retryable, and correlationId.
+
+[ ] Circuit breaker and retry errors are also mapped consistently.
+
+[ ] Logs contain correlationId to ease investigation.
+
+[ ] A demo endpoint (or Postman collection) shows how an upstream failure is translated to the frontend.
+
+
+Business Outcome
+
+Improved visibility for frontend teams and support.
+
+Faster troubleshooting of upstream issues.
+
+Consistent error response structure across all backend services
+
